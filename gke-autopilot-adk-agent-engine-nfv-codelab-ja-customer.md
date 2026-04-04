@@ -935,6 +935,8 @@ remote_agent = client.agent_engines.create(
         "requirements": [
             "google-cloud-aiplatform[agent_engines,adk]>=1.112",
             "pyyaml",
+            "pydantic",
+            "cloudpickle",
         ],
         "staging_bucket": STAGING_BUCKET,
     },
@@ -992,117 +994,3 @@ python test_remote_agent.py
 ```
 
 Google Cloud Console から、デプロイされた Agent を確認しても構いません。
-
-## この結果をテレコム顧客にどう説明するか
-Duration: 0:10:00
-
-ここまでで、テレコム/NFV 顧客向けにかなり説得力のあるモダナイゼーションストーリーができています。
-
-### メッセージ 1: GKE Autopilot の価値
-
-「引き継いだ運用チャートは、プラットフォーム側の強いデフォルトガードレールによって早い段階で止まりました。  
-これは、周辺ツールが過去の慣習でノードアクセスを前提にしてしまっているテレコム環境では、むしろ有益です。」
-
-### メッセージ 2: ADK の価値
-
-「単にチャットで YAML を直したのではありません。  
-ファイルを読み、manifest 全体を書き換え、検証コマンドを実行し、変更内容を説明する Agent を、再利用可能な形で作りました。」
-
-### メッセージ 3: Agent Engine の価値
-
-「ローカルのブラウザ UI で動いていた同じ Agent を、そのままマネージドな実行基盤へ持ち上げられます。  
-セッション管理、スケール、運用性の観点で次の段階へ進めます。」
-
-### メッセージ 4: なぜこの手のデモでは GKE が扱いやすいのか
-
-「このワークショップの形では、GKE Autopilot は Day-0 のクラスタ準備や worker 設定の説明量を減らせます。  
-その分、モダナイゼーションの成果そのものに時間を使えます。」
-
-## 追加課題: Agent Sandbox による安全なコマンド実行
-Duration: 0:10:00
-
-時間に余裕がある場合は、**Agent Sandbox** を紹介できます。
-
-話すポイントは次のとおりです。
-
-- Agent が shell コマンドを提案・実行する場合、より強い分離が欲しくなる
-- GKE には Agent Sandbox があり、より安全なコード実行の選択肢になる
-- これはプラットフォームエンジニアリングや自動リメディエーションの文脈と相性が良い
-
-ただし、3時間の本編ではここまで入れず、拡張編として扱うのが現実的です。
-
-## クリーンアップ
-Duration: 0:10:00
-
-Helm release を削除します。
-
-```bash
-helm uninstall "${RELEASE_NAME}" -n "${NAMESPACE}" || true
-```
-
-GKE クラスタを削除します。
-
-```bash
-gcloud container clusters delete "${CLUSTER_NAME}" \
-  --region "${REGION}" \
-  --quiet
-```
-
-staging bucket を削除します。
-
-```bash
-gcloud storage rm --recursive "${STAGING_BUCKET}" || true
-```
-
-リモート Agent をデプロイした場合は、Console またはスクリプトから削除してください。
-
-## このラボで達成したこと
-Duration: 0:00:00
-
-このラボでは、テレコム/NFV 顧客に対して現実味のあるモダナイゼーションワークフローを体験しました。
-
-具体的には次を実演しました。
-
-- 既存環境由来の運用 chart が GKE Autopilot で失敗すること
-- ADK Agent が chart を読み替え、書き換え、検証すること
-- Agent に対する開発者向け UI があること
-- 修正済み chart が Autopilot に正常デプロイできること
-- 同じ Agent を Vertex AI Agent Engine に昇格できること
-
-これは単なる「AI が YAML を直した」デモよりも強力です。  
-なぜなら、次を同時に見せているからです。
-
-- プラットフォームガードレール
-- Agent 化されたツール
-- 再現可能な検証フロー
-- 開発からマネージド実行基盤までの導線
-
-## Appendix: 発表者ノート
-Duration: 0:00:00
-
-### 推奨ポジショニング
-
-発表時は、次のような言い回しが使いやすいです。
-
-- 「すべてのパケット処理 CNF を Autopilot に載せるべきだと言っているわけではありません」
-- 「周辺の運用系資産のかなり大きな部分は、よりマネージドな基盤へモダナイズできます」
-- 「ポイントはセキュリティだけでなく、レビュー負荷の削減とプラットフォーム一貫性です」
-- 「この Agent は一度きりのプロンプトではなく、再利用可能な移行支援ツールになります」
-
-### EKS 比較での安全な言い回し
-
-比較は慎重に行います。
-
-- 「EKS 側も worker 運用の自動化を進めています」
-- 「ただし、このワークショップの形では GKE Autopilot のほうがインフラ説明を前段で減らしやすいです」
-- 「その結果、クラスタ mechanics ではなく modernization outcomes に時間を使いやすくなります」
-
-### 将来の発展案
-
-次のラボ候補としては、以下が考えられます。
-
-- Gatekeeper / Policy Controller を使ったポリシー検証の追加
-- Git に書き戻して GitOps へつなぐ
-- Agent Sandbox を使ったより安全なコマンド実行
-- モダナイゼーション進捗を可視化するダッシュボードやチケット連携
-- 専門領域ごとに複数 Agent へ分割する

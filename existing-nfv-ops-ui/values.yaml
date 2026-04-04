@@ -1,0 +1,15 @@
+image:
+  repository: nginx
+  pullPolicy: IfNotPresent
+  tag: "1.25"
+replicaCount: 1
+
+security:
+  privileged: true
+  hostNetwork: true
+  hostPID: true
+  allowPrivilegeEscalation: true
+
+service:
+  type: ClusterIP
+  port: 80
