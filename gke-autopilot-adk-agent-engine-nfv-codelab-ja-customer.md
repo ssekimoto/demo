@@ -914,12 +914,12 @@ Duration: 0:20:00
 ### デプロイスクリプトを作る
 
 ```bash
-cat > "${AGENT_DIR}/deploy_agent_engine.py" <<'EOF'
+cat > "${AGENT_DIR}/nfv_modernizer/deploy_agent_engine.py" <<'EOF'
 import os
 import vertexai
 from vertexai import agent_engines
 
-from nfv_modernizer.agent import root_agent
+from agent import root_agent
 
 PROJECT_ID = os.environ["PROJECT_ID"]
 REGION = os.environ["REGION"]
@@ -950,7 +950,7 @@ EOF
 ### デプロイを実行する
 
 ```bash
-cd "${AGENT_DIR}"
+cd "${AGENT_DIR}/nfv_modernizer"
 source "${LAB_DIR}/.venv/bin/activate"
 
 export PROJECT_ID="${PROJECT_ID}"
@@ -963,7 +963,7 @@ python deploy_agent_engine.py
 ### 任意: リモート Agent をコードから試す
 
 ```bash
-cat > "${AGENT_DIR}/test_remote_agent.py" <<'EOF'
+cat > "${AGENT_DIR}/nfv_modernizer/test_remote_agent.py" <<'EOF'
 import asyncio
 import os
 import vertexai
