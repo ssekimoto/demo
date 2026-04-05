@@ -140,7 +140,11 @@ curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 |
 python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
-pip install --upgrade "google-cloud-aiplatform[agent_engines,adk]>=1.112" pyyaml
+pip install --upgrade \
+  "google-cloud-aiplatform[agent_engines,adk]>=1.112" \
+  "pydantic>=2.6.4" \
+  "cloudpickle>=3.0.0" \
+  pyyaml
 ```
 
 ### Agent Engine 用の staging bucket を作る
@@ -458,6 +462,13 @@ helm template "${RELEASE_NAME}" ./existing-nfv-ops-ui \
 mkdir -p "${AGENT_DIR}/nfv_modernizer"
 cd "${AGENT_DIR}"
 
+cat > requirements.txt <<'EOF'
+google-cloud-aiplatform[agent_engines,adk]>=1.112.0
+pydantic>=2.6.4
+cloudpickle>=3.0.0
+pyyaml
+EOF
+
 cat > nfv_modernizer/__init__.py <<'EOF'
 from .agent import root_agent
 EOF
@@ -470,7 +481,7 @@ cat > nfv_modernizer/agent.py <<'EOF'
 import re
 from typing import Any
 
-from google.adk.agents import Agent
+from google.adk.agents import LlmAgent
 
 
 def analyze_autopilot_violations(text: str) -> dict[str, Any]:
@@ -566,9 +577,9 @@ JSON schema:
 }
 """
 
-root_agent = Agent(
+root_agent = LlmAgent(
     name="nfv_modernizer",
-    model="gemini-3.1-pro-preview",
+    model="gemini-2.5-pro",
     description="Modernizes an existing-environment NFV-adjacent Helm chart for GKE Autopilot.",
     instruction=SYSTEM_INSTRUCTION,
     tools=[
@@ -582,33 +593,22 @@ EOF
 ### Vertex AI Agent Engine へデプロイするスクリプトを作る
 
 ```bash
-cat > "${AGENT_DIR}/deploy_agent_engine.py" <<'EOF'
-import os
-import vertexai
-from vertexai import agent_engines
+cat > "${AGENT_DIR}/deploy_agent_engine.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
 
-from nfv_modernizer.agent import root_agent
+cd "${AGENT_DIR}"
+cp requirements.txt nfv_modernizer/requirements.txt
 
-PROJECT_ID = os.environ["PROJECT_ID"]
-REGION = os.environ["REGION"]
-STAGING_BUCKET = os.environ["STAGING_BUCKET"]
-
-client = vertexai.Client(project=PROJECT_ID, location=REGION)
-app = agent_engines.AdkApp(agent=root_agent)
-
-remote_agent = client.agent_engines.create(
-    agent=app,
-    config={
-        "requirements": [
-            "google-cloud-aiplatform[agent_engines,adk]>=1.112",
-        ],
-        "staging_bucket": STAGING_BUCKET,
-        "display_name": "nfv-modernizer-agent",
-    },
-)
-
-print(remote_agent.resource_name)
+adk deploy agent_engine \
+  --project "${PROJECT_ID}" \
+  --region "${REGION}" \
+  --display_name "nfv-modernizer-agent" \
+  --validate-agent-import \
+  nfv_modernizer
 EOF
+
+chmod +x "${AGENT_DIR}/deploy_agent_engine.sh"
 ```
 
 ### リモート Agent を呼び出して、修正版ファイルをローカルへ保存する helper script を作る
@@ -627,41 +627,99 @@ PROJECT_ID = os.environ["PROJECT_ID"]
 REGION = os.environ["REGION"]
 RESOURCE_NAME = os.environ["REMOTE_AGENT_RESOURCE_NAME"]
 LAB_DIR = Path(os.environ["LAB_DIR"])
-
-VALUES_PATH = LAB_DIR / "existing-nfv-ops-ui" / "values.yaml"
-DEPLOYMENT_PATH = LAB_DIR / "existing-nfv-ops-ui" / "templates" / "deployment.yaml"
+CHART_DIR = LAB_DIR / "existing-nfv-ops-ui"
+VALUES_PATH = CHART_DIR / "values.yaml"
+DEPLOYMENT_PATH = CHART_DIR / "templates" / "deployment.yaml"
 ERROR_PATH = LAB_DIR / "initial-install-error.txt"
-OUTPUT_JSON = LAB_DIR / "remote-modernization-output.json"
-RAW_TEXT = LAB_DIR / "remote-modernization-raw.txt"
+OUTPUT_DIR = CHART_DIR / "_agent_output"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def collect_strings(obj: Any) -> list[str]:
-    results: list[str] = []
+def to_plain(obj: Any) -> Any:
     if obj is None:
-        return results
-    if isinstance(obj, str):
-        results.append(obj)
-        return results
+        return None
+    if isinstance(obj, (str, int, float, bool)):
+        return obj
     if isinstance(obj, dict):
-        for value in obj.values():
-            results.extend(collect_strings(value))
-        return results
+        return {k: to_plain(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple, set)):
-        for item in obj:
-            results.extend(collect_strings(item))
-        return results
-    for attr in ("text", "content", "parts", "message"):
-        if hasattr(obj, attr):
-            try:
-                results.extend(collect_strings(getattr(obj, attr)))
-            except Exception:
-                pass
-    return results
+        return [to_plain(v) for v in obj]
+    if hasattr(obj, "model_dump"):
+        try:
+            return to_plain(obj.model_dump())
+        except Exception:
+            pass
+    if hasattr(obj, "__dict__"):
+        try:
+            return to_plain(vars(obj))
+        except Exception:
+            pass
+    return str(obj)
 
 
-values_text = VALUES_PATH.read_text()
-deployment_text = DEPLOYMENT_PATH.read_text()
-error_text = ERROR_PATH.read_text() if ERROR_PATH.exists() else ""
+def walk_strings(obj: Any):
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for value in obj.values():
+            yield from walk_strings(value)
+    elif isinstance(obj, list):
+        for value in obj:
+            yield from walk_strings(value)
+
+
+def try_json(text: str):
+    text = text.strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+
+def candidate_variants(raw: str):
+    values = []
+    raw = raw.strip()
+    values.append(raw)
+    values.append(raw.replace('\\"', '"'))
+    values.append(raw.replace("\\n", "\n").replace("\\t", "\t").replace("\\r", "\r"))
+    values.append(
+        raw.replace('\\"', '"')
+           .replace("\\n", "\n")
+           .replace("\\t", "\t")
+           .replace("\\r", "\r")
+    )
+    for base in list(values):
+        try:
+            values.append(bytes(base, "utf-8").decode("unicode_escape"))
+        except Exception:
+            pass
+    unique = []
+    seen = set()
+    for value in values:
+        if value not in seen:
+            unique.append(value)
+            seen.add(value)
+    return unique
+
+
+def extract_payload(texts: list[str]):
+    for text in texts:
+        match = re.search(r"BEGIN_REMOTE_JSON\s*(.*?)\s*END_REMOTE_JSON", text, flags=re.DOTALL)
+        if not match:
+            continue
+        raw = match.group(1).strip()
+        for candidate in candidate_variants(raw):
+            obj = try_json(candidate)
+            if isinstance(obj, dict) and "values_yaml" in obj and "deployment_yaml" in obj:
+                return obj
+    return None
+
+
+values_text = VALUES_PATH.read_text(encoding="utf-8")
+deployment_text = DEPLOYMENT_PATH.read_text(encoding="utf-8")
+error_text = ERROR_PATH.read_text(encoding="utf-8") if ERROR_PATH.exists() else ""
 
 message = f"""
 You are assisting a telecom core network platform team.
@@ -690,30 +748,39 @@ Observed install / Warden error:
 client = vertexai.Client(project=PROJECT_ID, location=REGION)
 remote_agent = client.agent_engines.get(RESOURCE_NAME)
 
-chunks: list[str] = []
+event_lines = []
+all_strings = []
+
 for event in remote_agent.stream_query(
     user_id="lab-user",
     message=message,
 ):
-    chunks.extend(collect_strings(event))
+    plain = to_plain(event)
+    event_lines.append(json.dumps(plain, ensure_ascii=False))
+    all_strings.extend(walk_strings(plain))
 
-joined = "\n".join([chunk for chunk in chunks if chunk]).strip()
-RAW_TEXT.write_text(joined)
+remote_events = OUTPUT_DIR / "remote_events.jsonl"
+remote_text = OUTPUT_DIR / "remote_text.txt"
+remote_events.write_text("\n".join(event_lines), encoding="utf-8")
+remote_text.write_text("\n\n---TEXT---\n\n".join(all_strings), encoding="utf-8")
 
-match = re.search(r"BEGIN_REMOTE_JSON\s*(\{[\s\S]*?\})\s*END_REMOTE_JSON", joined)
-if not match:
+payload = extract_payload(all_strings)
+if payload is None:
+    payload = extract_payload(event_lines)
+
+if payload is None:
     raise RuntimeError(
-        "Could not find BEGIN_REMOTE_JSON / END_REMOTE_JSON in remote response. "
-        f"See {RAW_TEXT} for the raw output."
+        "Agent の JSON 本体を抽出できませんでした。 "
+        f"{remote_events} と {remote_text} を確認してください。"
     )
 
-payload = json.loads(match.group(1))
-OUTPUT_JSON.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+output_json = OUTPUT_DIR / "response.json"
+output_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-VALUES_PATH.write_text(payload["values_yaml"])
-DEPLOYMENT_PATH.write_text(payload["deployment_yaml"])
+VALUES_PATH.write_text(payload["values_yaml"], encoding="utf-8")
+DEPLOYMENT_PATH.write_text(payload["deployment_yaml"], encoding="utf-8")
 
-print(f"Wrote modernization result to: {OUTPUT_JSON}")
+print(f"Wrote modernization result to: {output_json}")
 print(f"Updated: {VALUES_PATH}")
 print(f"Updated: {DEPLOYMENT_PATH}")
 print("\nChange summary:")
@@ -749,15 +816,14 @@ source "${LAB_DIR}/.venv/bin/activate"
 
 export PROJECT_ID="${PROJECT_ID}"
 export REGION="${REGION}"
-export STAGING_BUCKET="${STAGING_BUCKET}"
 
-python deploy_agent_engine.py | tee /tmp/remote_agent_resource_name.txt
+./deploy_agent_engine.sh | tee /tmp/remote_agent_resource_name.txt
 ```
 
 環境変数へ resource name を設定します。
 
 ```bash
-export REMOTE_AGENT_RESOURCE_NAME=$(tail -n 1 /tmp/remote_agent_resource_name.txt)
+export REMOTE_AGENT_RESOURCE_NAME=$(grep -Eo 'projects/[^ ]+/locations/[^ ]+/reasoningEngines/[0-9]+' /tmp/remote_agent_resource_name.txt | tail -n 1)
 echo "${REMOTE_AGENT_RESOURCE_NAME}"
 ```
 
@@ -774,7 +840,6 @@ python run_remote_modernize.py
 diff -u values-before.yaml existing-nfv-ops-ui/values.yaml || true
 diff -u deployment-before.yaml existing-nfv-ops-ui/templates/deployment.yaml || true
 ```
-
 
 ### 参考実装を使いたい場合
 
@@ -919,91 +984,4 @@ kubectl port-forward -n "${NAMESPACE}" svc/existing-nfv-ops-ui 8080:80
 
 Cloud Shell の Web Preview から転送ポートを開き、UI が表示されることを確認します。
 
-## 同じ Agent を Vertex AI Agent Engine にデプロイする
-Duration: 0:20:00
-
-ここでは、ローカルで使った Agent をそのまま Agent Engine にデプロイします。
-
-### デプロイスクリプトを作る
-
-```bash
-cat > "${AGENT_DIR}/nfv_modernizer/deploy_agent_engine.py" <<'EOF'
-import os
-import vertexai
-from vertexai import agent_engines
-
-from agent import root_agent
-
-PROJECT_ID = os.environ["PROJECT_ID"]
-REGION = os.environ["REGION"]
-STAGING_BUCKET = os.environ["STAGING_BUCKET"]
-
-client = vertexai.Client(project=PROJECT_ID, location=REGION)
-
-app = agent_engines.AdkApp(agent=root_agent)
-
-remote_agent = client.agent_engines.create(
-    agent=app,
-    config={
-        "requirements": [
-            "google-cloud-aiplatform[agent_engines,adk]>=1.112",
-            "pyyaml",
-            "pydantic",
-            "cloudpickle",
-        ],
-        "staging_bucket": STAGING_BUCKET,
-    },
-)
-
-print("REMOTE_AGENT_RESOURCE_NAME")
-print(remote_agent.resource_name)
-EOF
-```
-
-### デプロイを実行する
-
-```bash
-cd "${AGENT_DIR}/nfv_modernizer"
-source "${LAB_DIR}/.venv/bin/activate"
-
-export PROJECT_ID="${PROJECT_ID}"
-export REGION="${REGION}"
-export STAGING_BUCKET="${STAGING_BUCKET}"
-
-python deploy_agent_engine.py
-```
-
-### 任意: リモート Agent をコードから試す
-
-```bash
-cat > "${AGENT_DIR}/nfv_modernizer/test_remote_agent.py" <<'EOF'
-import asyncio
-import os
-import vertexai
-
-RESOURCE_NAME = os.environ["REMOTE_AGENT_RESOURCE_NAME"]
-PROJECT_ID = os.environ["PROJECT_ID"]
-REGION = os.environ["REGION"]
-
-client = vertexai.Client(project=PROJECT_ID, location=REGION)
-remote_agent = client.agent_engines.get(RESOURCE_NAME)
-
-async def main():
-    async for event in remote_agent.async_stream_query(
-        user_id="lab-user",
-        message="Summarize what changed in the Helm chart and why it is safer for GKE Autopilot.",
-    ):
-        print(event)
-
-asyncio.run(main())
-EOF
-```
-
-前のステップで表示された resource name を設定して、テストします。
-
-```bash
-export REMOTE_AGENT_RESOURCE_NAME="PASTE_THE_RESOURCE_NAME_HERE"
-python test_remote_agent.py
-```
-
-Google Cloud Console から、デプロイされた Agent を確認しても構いません。
+確認できれば Lab は完了です！
