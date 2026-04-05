@@ -181,12 +181,12 @@ kubectl get nodes
 kubectl get ns
 ```
 
-## 既存環境由来のテレコム運用 Helm チャートを作る
+## 既存環境由来の運用 Helm チャートを作る
 Duration: 0:20:00
 
 このセクションでは、`existing-nfv-ops-ui` という、既存環境由来の設定を含むチャートを作成します。
 
-このチャートは、既存の Kubernetes 環境で利用されていた設定を引き継いだ**架空のテレコム運用 Web コンソール**です。  
+このチャートは、既存の Kubernetes 環境で利用されていた設定を引き継いだ**架空の運用 Web コンソール**です。  
 NFV 隣接のツールで見かけやすい、いくつかの古い前提を含めています。
 
 ### chart ディレクトリを作る
@@ -302,7 +302,7 @@ data:
     <body>
       <div class="card">
         <h1>既存環境由来 NFV Operations UI</h1>
-        <p>この UI は、引き継いだテレコム運用コンソールを模したサンプルです。</p>
+        <p>この UI は、引き継いだ運用コンソールを模したサンプルです。</p>
         <ul>
           <li>想定モード: <code>existing-env-node-inspection</code></li>
           <li>元の前提: ホストアクセスが許されている</li>
@@ -426,7 +426,11 @@ helm install "${RELEASE_NAME}" ./existing-nfv-ops-ui \
 
 Autopilot 互換の制約に違反しているため、admission レイヤーで失敗するはずです。
 
-後で Agent に読ませるため、出力を保存します。
+後で Agent に読ませるため、一度削除して出力を保存します。
+
+```bash
+helm uninstall "${RELEASE_NAME}" --namespace "${NAMESPACE}"
+```
 
 ```bash
 helm install "${RELEASE_NAME}" ./existing-nfv-ops-ui \
@@ -440,19 +444,13 @@ helm template "${RELEASE_NAME}" ./existing-nfv-ops-ui \
   --namespace "${NAMESPACE}" > "${LAB_DIR}/rendered-before.yaml"
 ```
 
-## ADK でモダナイゼーション Agent を作る
-Duration: 0:35:00
+### この Agent に持たせる役割
 
-このセクションでは、ADK を使ってローカルの Agent プロジェクトを作成します。
-
-この Agent には次のようなツールを持たせます。
-
-- ファイルを読む
-- ファイルを書く
-- diff を見る
-- 制限付きシェルコマンドを実行する
-- chart を検証する
-- install / upgrade の準備を行う
+- Autopilot 非互換箇所を抽出する
+- テレコム/NFV 顧客に説明しやすい置き換え方を選ぶ
+- 完全な `values.yaml` を返す
+- 完全な `templates/deployment.yaml` を返す
+- 検証コマンドと変更理由を返す
 
 ### ADK プロジェクトの構成を作る
 
@@ -461,7 +459,7 @@ mkdir -p "${AGENT_DIR}/nfv_modernizer"
 cd "${AGENT_DIR}"
 
 cat > nfv_modernizer/__init__.py <<'EOF'
-from . import agent
+from .agent import root_agent
 EOF
 ```
 
@@ -469,101 +467,14 @@ EOF
 
 ```bash
 cat > nfv_modernizer/agent.py <<'EOF'
-import difflib
-import os
 import re
-import subprocess
-from pathlib import Path
+from typing import Any
 
 from google.adk.agents import Agent
 
-BASE_DIR = Path(os.environ.get("LAB_DIR", str(Path.home() / "nfv-modernization-lab"))).resolve()
-CHART_DIR = BASE_DIR / "existing-nfv-ops-ui"
-ALLOWED_PREFIXES = [
-    "helm template",
-    "helm lint",
-    "helm upgrade",
-    "helm install",
-    "helm uninstall",
-    "kubectl get",
-    "kubectl apply",
-    "kubectl describe",
-    "cat ",
-    "sed ",
-    "grep ",
-    "python3 ",
-]
 
-def _safe_path(path: str) -> Path:
-    p = (BASE_DIR / path).resolve() if not path.startswith("/") else Path(path).resolve()
-    if BASE_DIR not in p.parents and p != BASE_DIR:
-        raise ValueError(f"path not allowed: {path}")
-    return p
-
-def read_text_file(path: str) -> dict:
-    """Read a text file from the lab directory."""
-    try:
-        p = _safe_path(path)
-        return {"status": "success", "path": str(p), "content": p.read_text()}
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
-
-def write_text_file(path: str, content: str) -> dict:
-    """Write a text file under the lab directory."""
-    try:
-        p = _safe_path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content)
-        return {"status": "success", "path": str(p), "bytes": len(content.encode())}
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
-
-def unified_diff(path_a: str, path_b: str) -> dict:
-    """Show a unified diff between two text files."""
-    try:
-        a = _safe_path(path_a).read_text().splitlines(keepends=True)
-        b = _safe_path(path_b).read_text().splitlines(keepends=True)
-        diff = "".join(
-            difflib.unified_diff(
-                a,
-                b,
-                fromfile=path_a,
-                tofile=path_b,
-            )
-        )
-        return {"status": "success", "diff": diff}
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
-
-def run_command(command: str) -> dict:
-    """Run a restricted shell command needed for chart validation and deployment."""
-    try:
-        if not any(command.startswith(prefix) for prefix in ALLOWED_PREFIXES):
-            return {
-                "status": "error",
-                "error": f"command not allowed: {command}",
-                "allowed_prefixes": ALLOWED_PREFIXES,
-            }
-
-        proc = subprocess.run(
-            command,
-            shell=True,
-            cwd=str(BASE_DIR),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=180,
-        )
-        return {
-            "status": "success",
-            "returncode": proc.returncode,
-            "output": proc.stdout,
-        }
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
-
-def analyze_autopilot_violations(text: str) -> dict:
-    """Extract likely Autopilot-incompatible fields from error text or rendered manifests."""
+def analyze_autopilot_violations(text: str) -> dict[str, Any]:
+    """Extract likely Autopilot-incompatible settings from chart text or error text."""
     findings = []
     patterns = {
         "privileged": r"privileged",
@@ -573,6 +484,7 @@ def analyze_autopilot_violations(text: str) -> dict:
         "hostPath": r"hostPath",
         "allowPrivilegeEscalation": r"allowPrivilegeEscalation",
     }
+
     lowered = text.lower()
     for name, pattern in patterns.items():
         if re.search(pattern.lower(), lowered):
@@ -582,186 +494,287 @@ def analyze_autopilot_violations(text: str) -> dict:
     if "privileged" in findings:
         recommendations.append("set privileged to false")
     if "hostNetwork" in findings:
-        recommendations.append("set hostNetwork to false and use Service networking")
+        recommendations.append("set hostNetwork to false and use a Service")
     if "hostPID" in findings:
         recommendations.append("set hostPID to false")
     if "hostPort" in findings:
-        recommendations.append("remove hostPort and use a Kubernetes Service")
+        recommendations.append("remove hostPort and expose via a Kubernetes Service")
     if "hostPath" in findings:
-        recommendations.append("remove hostPath and use ConfigMap, emptyDir, or PVC")
+        recommendations.append("replace hostPath with ConfigMap, emptyDir, or PVC")
     if "allowPrivilegeEscalation" in findings:
         recommendations.append("set allowPrivilegeEscalation to false")
 
     return {
-        "status": "success",
         "findings": findings,
         "recommendations": recommendations,
     }
 
-def validate_chart() -> dict:
-    """Run a validation sequence for the chart."""
-    checks = []
 
-    cmds = [
-        'helm lint ./existing-nfv-ops-ui',
-        'helm template existing-ops-ui ./existing-nfv-ops-ui --namespace nfv-modernization',
-        'kubectl apply --dry-run=server -n nfv-modernization -f rendered-after.yaml',
-    ]
+def telecom_modernization_rules() -> dict[str, Any]:
+    """Return the platform rules the agent must respect."""
+    return {
+        "autopilot_rules": {
+            "privileged": False,
+            "hostNetwork": False,
+            "hostPID": False,
+            "allowPrivilegeEscalation": False,
+            "hostPort": "not allowed",
+            "hostPath": "avoid unless absolutely required; prefer ConfigMap, emptyDir, or PVC",
+        },
+        "preferred_replacements": {
+            "node-coupled networking": "Service-based access",
+            "host log mount": "application-owned paths or platform logging integration",
+            "hostPort exposure": "ClusterIP Service plus port-forward or ingress path",
+        },
+        "customer_messaging": [
+            "preserve operational intent",
+            "remove host-level coupling",
+            "make changes explainable to telecom platform teams",
+        ],
+    }
 
-    for cmd in cmds:
-        if cmd.endswith("rendered-after.yaml"):
-            rendered = subprocess.run(
-                'helm template existing-ops-ui ./existing-nfv-ops-ui --namespace nfv-modernization > rendered-after.yaml',
-                shell=True,
-                cwd=str(BASE_DIR),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                timeout=180,
-            )
-            checks.append(
-                {
-                    "command": "helm template existing-ops-ui ./existing-nfv-ops-ui --namespace nfv-modernization > rendered-after.yaml",
-                    "returncode": rendered.returncode,
-                    "output": rendered.stdout,
-                }
-            )
-
-        proc = subprocess.run(
-            cmd,
-            shell=True,
-            cwd=str(BASE_DIR),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=180,
-        )
-        checks.append({"command": cmd, "returncode": proc.returncode, "output": proc.stdout})
-
-    success = all(item["returncode"] == 0 for item in checks)
-    return {"status": "success", "success": success, "checks": checks}
 
 SYSTEM_INSTRUCTION = """
-You are a Kubernetes modernization agent helping a telecom platform team.
+You are a Kubernetes modernization agent assisting a telecom platform team.
 
-Your job:
-1. inspect existing-environment Helm charts under the lab directory
-2. identify settings incompatible with GKE Autopilot
-3. rewrite full files, not partial snippets
-4. preserve application intent where possible
-5. replace node-coupled behavior with Kubernetes-native alternatives
+You will receive:
+- the current values.yaml
+- the current templates/deployment.yaml
+- a Helm install or Warden error message
 
-Modernization rules:
-- privileged must be false
-- hostNetwork must be false
-- hostPID must be false
-- remove hostPort usage
-- remove hostPath usage
-- set allowPrivilegeEscalation to false
-- prefer Service-based access over host networking
-- keep the resulting workload easy to explain to an NFV customer
-- preserve the operational UI behavior
-- always validate after changes
-- when changing a file, write the whole file content
+Your task:
+1. identify every Autopilot-incompatible setting
+2. rewrite the full values.yaml
+3. rewrite the full templates/deployment.yaml
+4. preserve the operational UI behavior where possible
+5. replace host-level coupling with Kubernetes-native alternatives
+6. explain the change in telecom / NFV platform terms
 
-Workflow:
-- read values.yaml and deployment.yaml first
-- analyze the Helm install error if present
-- propose the exact file rewrites
-- write the changes
-- run validation
-- if validation passes, suggest a helm upgrade/install command
+Output rules:
+- return only one JSON object between BEGIN_REMOTE_JSON and END_REMOTE_JSON
+- do not return markdown fences
+- do not omit fields
+- all file outputs must be full file contents, not patches
+
+JSON schema:
+{
+  "values_yaml": "full file contents",
+  "deployment_yaml": "full file contents",
+  "change_summary": ["bullet 1", "bullet 2"],
+  "customer_rationale": ["message 1", "message 2"],
+  "validation_commands": ["helm lint ...", "helm template ..."]
+}
 """
 
 root_agent = Agent(
     name="nfv_modernizer",
-    model="gemini-2.5-flash",
+    model="gemini-3.1-pro-preview",
     description="Modernizes an existing-environment NFV-adjacent Helm chart for GKE Autopilot.",
     instruction=SYSTEM_INSTRUCTION,
     tools=[
-        read_text_file,
-        write_text_file,
-        unified_diff,
-        run_command,
         analyze_autopilot_violations,
-        validate_chart,
+        telecom_modernization_rules,
     ],
 )
 EOF
 ```
 
-### Agent が chart を見つけられるように環境変数を export する
+### Vertex AI Agent Engine へデプロイするスクリプトを作る
 
 ```bash
-export LAB_DIR="${LAB_DIR}"
+cat > "${AGENT_DIR}/deploy_agent_engine.py" <<'EOF'
+import os
+import vertexai
+from vertexai import agent_engines
+
+from nfv_modernizer.agent import root_agent
+
+PROJECT_ID = os.environ["PROJECT_ID"]
+REGION = os.environ["REGION"]
+STAGING_BUCKET = os.environ["STAGING_BUCKET"]
+
+client = vertexai.Client(project=PROJECT_ID, location=REGION)
+app = agent_engines.AdkApp(agent=root_agent)
+
+remote_agent = client.agent_engines.create(
+    agent=app,
+    config={
+        "requirements": [
+            "google-cloud-aiplatform[agent_engines,adk]>=1.112",
+        ],
+        "staging_bucket": STAGING_BUCKET,
+        "display_name": "nfv-modernizer-agent",
+    },
+)
+
+print(remote_agent.resource_name)
+EOF
 ```
 
-### diff 用のベースラインを保存する
+### リモート Agent を呼び出して、修正版ファイルをローカルへ保存する helper script を作る
 
 ```bash
+cat > "${AGENT_DIR}/run_remote_modernize.py" <<'EOF'
+import json
+import os
+import re
+from pathlib import Path
+from typing import Any
+
+import vertexai
+
+PROJECT_ID = os.environ["PROJECT_ID"]
+REGION = os.environ["REGION"]
+RESOURCE_NAME = os.environ["REMOTE_AGENT_RESOURCE_NAME"]
+LAB_DIR = Path(os.environ["LAB_DIR"])
+
+VALUES_PATH = LAB_DIR / "existing-nfv-ops-ui" / "values.yaml"
+DEPLOYMENT_PATH = LAB_DIR / "existing-nfv-ops-ui" / "templates" / "deployment.yaml"
+ERROR_PATH = LAB_DIR / "initial-install-error.txt"
+OUTPUT_JSON = LAB_DIR / "remote-modernization-output.json"
+RAW_TEXT = LAB_DIR / "remote-modernization-raw.txt"
+
+
+def collect_strings(obj: Any) -> list[str]:
+    results: list[str] = []
+    if obj is None:
+        return results
+    if isinstance(obj, str):
+        results.append(obj)
+        return results
+    if isinstance(obj, dict):
+        for value in obj.values():
+            results.extend(collect_strings(value))
+        return results
+    if isinstance(obj, (list, tuple, set)):
+        for item in obj:
+            results.extend(collect_strings(item))
+        return results
+    for attr in ("text", "content", "parts", "message"):
+        if hasattr(obj, attr):
+            try:
+                results.extend(collect_strings(getattr(obj, attr)))
+            except Exception:
+                pass
+    return results
+
+
+values_text = VALUES_PATH.read_text()
+deployment_text = DEPLOYMENT_PATH.read_text()
+error_text = ERROR_PATH.read_text() if ERROR_PATH.exists() else ""
+
+message = f"""
+You are assisting a telecom core network platform team.
+
+Please modernize the following Helm chart so it can run on GKE Autopilot.
+
+Return only one JSON object between BEGIN_REMOTE_JSON and END_REMOTE_JSON.
+Do not use markdown fences.
+
+Current values.yaml:
+---VALUES_YAML_START---
+{values_text}
+---VALUES_YAML_END---
+
+Current templates/deployment.yaml:
+---DEPLOYMENT_YAML_START---
+{deployment_text}
+---DEPLOYMENT_YAML_END---
+
+Observed install / Warden error:
+---ERROR_START---
+{error_text}
+---ERROR_END---
+"""
+
+client = vertexai.Client(project=PROJECT_ID, location=REGION)
+remote_agent = client.agent_engines.get(RESOURCE_NAME)
+
+chunks: list[str] = []
+for event in remote_agent.stream_query(
+    user_id="lab-user",
+    message=message,
+):
+    chunks.extend(collect_strings(event))
+
+joined = "\n".join([chunk for chunk in chunks if chunk]).strip()
+RAW_TEXT.write_text(joined)
+
+match = re.search(r"BEGIN_REMOTE_JSON\s*(\{[\s\S]*?\})\s*END_REMOTE_JSON", joined)
+if not match:
+    raise RuntimeError(
+        "Could not find BEGIN_REMOTE_JSON / END_REMOTE_JSON in remote response. "
+        f"See {RAW_TEXT} for the raw output."
+    )
+
+payload = json.loads(match.group(1))
+OUTPUT_JSON.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+
+VALUES_PATH.write_text(payload["values_yaml"])
+DEPLOYMENT_PATH.write_text(payload["deployment_yaml"])
+
+print(f"Wrote modernization result to: {OUTPUT_JSON}")
+print(f"Updated: {VALUES_PATH}")
+print(f"Updated: {DEPLOYMENT_PATH}")
+print("\nChange summary:")
+for item in payload.get("change_summary", []):
+    print(f"- {item}")
+
+print("\nCustomer rationale:")
+for item in payload.get("customer_rationale", []):
+    print(f"- {item}")
+
+print("\nSuggested validation commands:")
+for item in payload.get("validation_commands", []):
+    print(f"- {item}")
+EOF
+```
+
+### 変更前のベースラインを保存する
+
+```bash
+cd "${LAB_DIR}"
 cp existing-nfv-ops-ui/values.yaml values-before.yaml
 cp existing-nfv-ops-ui/templates/deployment.yaml deployment-before.yaml
 ```
 
-## ADK Web UI を使う
-Duration: 0:20:00
+## Vertex AI Agent Engine に直接デプロイし、リモート Agent を呼び出す
+Duration: 0:25:00
 
-Agent プロジェクトの親ディレクトリへ移動します。
+### Agent をデプロイする
 
 ```bash
 cd "${AGENT_DIR}"
 source "${LAB_DIR}/.venv/bin/activate"
-adk web
+
+export PROJECT_ID="${PROJECT_ID}"
+export REGION="${REGION}"
+export STAGING_BUCKET="${STAGING_BUCKET}"
+
+python deploy_agent_engine.py | tee /tmp/remote_agent_resource_name.txt
 ```
 
-Cloud Shell の Web Preview から、公開されたポートを開きます。
-
-ADK Web UI 上で、`nfv_modernizer` Agent を選択します。
-
-### Agent へのプロンプト
-
-次のプロンプトを使います。
-
-```text
-You are assisting a telecom platform team that inherited an NFV operations Helm chart from an existing environment.
-
-Please modernize the chart under the lab directory so it can run on GKE Autopilot.
-
-Requirements:
-- rewrite full files, not fragments
-- preserve the UI behavior
-- remove host-level coupling
-- use Kubernetes-native networking
-- validate with helm lint, helm template, and kubectl apply --dry-run=server
-- explain every change in telecom platform terms
-```
-
-### 期待される Agent の動き
-
-良い結果であれば、少なくとも次の多くを満たします。
-
-- `privileged` を無効化する
-- `hostNetwork` を無効化する
-- `hostPID` を無効化する
-- `allowPrivilegeEscalation` を無効化する
-- `hostPath` volume を削除する
-- `hostPort` を削除する
-- ネットワーク公開抽象として Service を維持する
-- ConfigMap から NGINX を構成する挙動を維持する
-- resource requests / limits を保持する
-- 検証コマンドを生成または実行する
-
-### 更新後のファイルを確認する
-
-Cloud Shell 側で次を実行します。
+環境変数へ resource name を設定します。
 
 ```bash
-cp existing-nfv-ops-ui/values.yaml values-after.yaml
-cp existing-nfv-ops-ui/templates/deployment.yaml deployment-after.yaml
-
-diff -u values-before.yaml values-after.yaml || true
-diff -u deployment-before.yaml deployment-after.yaml || true
+export REMOTE_AGENT_RESOURCE_NAME=$(tail -n 1 /tmp/remote_agent_resource_name.txt)
+echo "${REMOTE_AGENT_RESOURCE_NAME}"
 ```
+
+### リモート Agent に chart 内容を渡して修正版ファイルを生成する
+
+```bash
+export LAB_DIR="${LAB_DIR}"
+python run_remote_modernize.py
+```
+
+### 修正差分を確認する
+
+```bash
+diff -u values-before.yaml existing-nfv-ops-ui/values.yaml || true
+diff -u deployment-before.yaml existing-nfv-ops-ui/templates/deployment.yaml || true
+```
+
 
 ### 参考実装を使いたい場合
 
