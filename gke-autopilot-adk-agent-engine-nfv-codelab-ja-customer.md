@@ -105,7 +105,7 @@ Cloud Shell を開いて、次を実行します。
 
 ```bash
 export PROJECT_ID=$(gcloud config get-value project)
-export REGION="asia-northeast1"
+export REGION="us-central1"
 export CLUSTER_NAME="nfv-modernization-lab"
 export RELEASE_NAME="existing-ops-ui"
 export NAMESPACE="nfv-modernization"
