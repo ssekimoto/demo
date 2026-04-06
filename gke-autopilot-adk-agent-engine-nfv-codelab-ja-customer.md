@@ -414,6 +414,7 @@ EOF
 ### chart を確認する
 
 ```bash
+sudo apt install -y tree
 tree existing-nfv-ops-ui
 helm template "${RELEASE_NAME}" ./existing-nfv-ops-ui | sed -n '1,220p'
 ```
