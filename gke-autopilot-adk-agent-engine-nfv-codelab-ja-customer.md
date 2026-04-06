@@ -628,6 +628,7 @@ PROJECT_ID = os.environ["PROJECT_ID"]
 REGION = os.environ["REGION"]
 RESOURCE_NAME = os.environ["REMOTE_AGENT_RESOURCE_NAME"]
 LAB_DIR = Path(os.environ["LAB_DIR"])
+
 CHART_DIR = LAB_DIR / "existing-nfv-ops-ui"
 VALUES_PATH = CHART_DIR / "values.yaml"
 DEPLOYMENT_PATH = CHART_DIR / "templates" / "deployment.yaml"
@@ -682,6 +683,7 @@ def try_json(text: str):
 def candidate_variants(raw: str):
     values = []
     raw = raw.strip()
+
     values.append(raw)
     values.append(raw.replace('\\"', '"'))
     values.append(raw.replace("\\n", "\n").replace("\\t", "\t").replace("\\r", "\r"))
@@ -691,11 +693,13 @@ def candidate_variants(raw: str):
            .replace("\\t", "\t")
            .replace("\\r", "\r")
     )
+
     for base in list(values):
         try:
             values.append(bytes(base, "utf-8").decode("unicode_escape"))
         except Exception:
             pass
+
     unique = []
     seen = set()
     for value in values:
@@ -711,6 +715,7 @@ def extract_payload(texts: list[str]):
         if not match:
             continue
         raw = match.group(1).strip()
+
         for candidate in candidate_variants(raw):
             obj = try_json(candidate)
             if isinstance(obj, dict) and "values_yaml" in obj and "deployment_yaml" in obj:
@@ -747,7 +752,7 @@ Observed install / Warden error:
 """
 
 client = vertexai.Client(project=PROJECT_ID, location=REGION)
-remote_agent = client.agent_engines.get(RESOURCE_NAME)
+remote_agent = client.agent_engines.get(name=RESOURCE_NAME)
 
 event_lines = []
 all_strings = []
@@ -767,23 +772,23 @@ remote_text.write_text("\n\n---TEXT---\n\n".join(all_strings), encoding="utf-8")
 
 payload = extract_payload(all_strings)
 if payload is None:
-    payload = extract_payload(event_lines)
-
-if payload is None:
     raise RuntimeError(
-        "Agent の JSON 本体を抽出できませんでした。 "
-        f"{remote_events} と {remote_text} を確認してください。"
+        "BEGIN_REMOTE_JSON / END_REMOTE_JSON から JSON を抽出できませんでした。"
+        f" raw: {remote_text}"
     )
 
-output_json = OUTPUT_DIR / "response.json"
-output_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+(OUTPUT_DIR / "remote-modernization-output.json").write_text(
+    json.dumps(payload, ensure_ascii=False, indent=2),
+    encoding="utf-8",
+)
 
 VALUES_PATH.write_text(payload["values_yaml"], encoding="utf-8")
 DEPLOYMENT_PATH.write_text(payload["deployment_yaml"], encoding="utf-8")
 
-print(f"Wrote modernization result to: {output_json}")
+print(f"Wrote modernization result to: {OUTPUT_DIR / 'remote-modernization-output.json'}")
 print(f"Updated: {VALUES_PATH}")
 print(f"Updated: {DEPLOYMENT_PATH}")
+
 print("\nChange summary:")
 for item in payload.get("change_summary", []):
     print(f"- {item}")
@@ -838,6 +843,8 @@ python run_remote_modernize.py
 ### 修正差分を確認する
 
 ```bash
+cd "${LAB_DIR}"
+
 diff -u values-before.yaml existing-nfv-ops-ui/values.yaml || true
 diff -u deployment-before.yaml existing-nfv-ops-ui/templates/deployment.yaml || true
 ```
